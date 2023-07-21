@@ -7,7 +7,7 @@ from longformer.diagonaled_mm_tvm import diagonaled_mm as diagonaled_mm_tvm, mas
 from longformer.sliding_chunks import sliding_chunks_matmul_qk, sliding_chunks_matmul_pv
 from longformer.sliding_chunks import sliding_chunks_no_overlap_matmul_qk, sliding_chunks_no_overlap_matmul_pv
 from transformers.modeling_roberta import RobertaConfig, RobertaModel, RobertaForMaskedLM
-
+import joblib
 
 class Longformer(RobertaModel):
     def __init__(self, config):
@@ -85,63 +85,7 @@ class LongformerSelfAttention(nn.Module):
             assert not self.autoregressive  # not supported
             assert self.attention_dilation == 1  # dilation is not supported
 
-    def forward(
-        self,
-        hidden_states,
-        attention_mask=None,
-        head_mask=None,
-        encoder_hidden_states=None,
-        encoder_attention_mask=None,
-        output_attentions=False,
-    ):
-        '''
-        The `attention_mask` is changed in `BertModel.forward` from 0, 1, 2 to
-            -ve: no attention
-              0: local attention
-            +ve: global attention
-        '''
-        assert encoder_hidden_states is None, "`encoder_hidden_states` is not supported and should be None"
-        assert encoder_attention_mask is None, "`encoder_attention_mask` is not supported and shiould be None"
-
-        if attention_mask is not None:
-            attention_mask = attention_mask.squeeze(dim=2).squeeze(dim=1)
-            key_padding_mask = attention_mask < 0
-            extra_attention_mask = attention_mask > 0
-            remove_from_windowed_attention_mask = attention_mask != 0
-
-            num_extra_indices_per_batch = extra_attention_mask.long().sum(dim=1)
-            max_num_extra_indices_per_batch = num_extra_indices_per_batch.max()
-            if max_num_extra_indices_per_batch <= 0:
-                extra_attention_mask = None
-            else:
-                # To support the case of variable number of global attention in the rows of a batch,
-                # we use the following three selection masks to select global attention embeddings
-                # in a 3d tensor and pad it to `max_num_extra_indices_per_batch`
-                # 1) selecting embeddings that correspond to global attention
-                extra_attention_mask_nonzeros = extra_attention_mask.nonzero(as_tuple=True)
-                zero_to_max_range = torch.arange(0, max_num_extra_indices_per_batch,
-                                                 device=num_extra_indices_per_batch.device)
-                # mask indicating which values are actually going to be padding
-                selection_padding_mask = zero_to_max_range < num_extra_indices_per_batch.unsqueeze(dim=-1)
-                # 2) location of the non-padding values in the selected global attention
-                selection_padding_mask_nonzeros = selection_padding_mask.nonzero(as_tuple=True)
-                # 3) location of the padding values in the selected global attention
-                selection_padding_mask_zeros = (selection_padding_mask == 0).nonzero(as_tuple=True)
-        else:
-            remove_from_windowed_attention_mask = None
-            extra_attention_mask = None
-            key_padding_mask = None
-
-        hidden_states = hidden_states.transpose(0, 1)
-        seq_len, bsz, embed_dim = hidden_states.size()
-        assert embed_dim == self.embed_dim
-        q = self.query(hidden_states)
-        k = self.key(hidden_states)
-        v = self.value(hidden_states)
-        q /= math.sqrt(self.head_dim)
-
-        q = q.view(seq_len, bsz, self.num_heads, self.head_dim).transpose(0, 1)
-        k = k.view(seq_len, bsz, self.num_heads, self.head_dim).transpose(0, 1)
+    def predict(self, q, k, v, remove_from_windowed_attention_mask, bsz, seq_len, extra_attention_mask, max_num_extra_indices_per_batch, selection_padding_mask_zeros, key_padding_mask, hidden_states, output_attentions, extra_attention_mask_nonzeros, selection_padding_mask_nonzeros, embed_dim):
         # attn_weights = (bsz, seq_len, num_heads, window*2+1)
         if self.attention_mode == 'tvm':
             q = q.float().contiguous()
@@ -265,5 +209,71 @@ class LongformerSelfAttention(nn.Module):
                 # batch_size x num_heads x sequence_length x window_size
                 # which is the attention weights of every token attending to its neighbours
                 attn_weights = attn_weights.permute(0, 2, 1, 3)
+        return context_layer, attn_weights
+
+    def forward(
+        self,
+        hidden_states,
+        attention_mask=None,
+        head_mask=None,
+        encoder_hidden_states=None,
+        encoder_attention_mask=None,
+        output_attentions=False,
+    ):
+        # import joblib
+        # joblib.dump([hidden_states, attention_mask, head_mask, encoder_hidden_states, encoder_attention_mask, output_attentions], 'inputs.pkl')
+
+        '''
+        The `attention_mask` is changed in `BertModel.forward` from 0, 1, 2 to
+            -ve: no attention
+              0: local attention
+            +ve: global attention
+        '''
+        assert encoder_hidden_states is None, "`encoder_hidden_states` is not supported and should be None"
+        assert encoder_attention_mask is None, "`encoder_attention_mask` is not supported and shiould be None"
+
+        if attention_mask is not None:
+            attention_mask = attention_mask.squeeze(dim=2).squeeze(dim=1)
+            key_padding_mask = attention_mask < 0
+            extra_attention_mask = attention_mask > 0
+            remove_from_windowed_attention_mask = attention_mask != 0
+
+            num_extra_indices_per_batch = extra_attention_mask.long().sum(dim=1)
+            max_num_extra_indices_per_batch = num_extra_indices_per_batch.max()
+            if max_num_extra_indices_per_batch <= 0:
+                extra_attention_mask = None
+            else:
+                # To support the case of variable number of global attention in the rows of a batch,
+                # we use the following three selection masks to select global attention embeddings
+                # in a 3d tensor and pad it to `max_num_extra_indices_per_batch`
+                # 1) selecting embeddings that correspond to global attention
+                extra_attention_mask_nonzeros = extra_attention_mask.nonzero(as_tuple=True)
+                zero_to_max_range = torch.arange(0, max_num_extra_indices_per_batch,
+                                                 device=num_extra_indices_per_batch.device)
+                # mask indicating which values are actually going to be padding
+                selection_padding_mask = zero_to_max_range < num_extra_indices_per_batch.unsqueeze(dim=-1)
+                # 2) location of the non-padding values in the selected global attention
+                selection_padding_mask_nonzeros = selection_padding_mask.nonzero(as_tuple=True)
+                # 3) location of the padding values in the selected global attention
+                selection_padding_mask_zeros = (selection_padding_mask == 0).nonzero(as_tuple=True)
+        else:
+            remove_from_windowed_attention_mask = None
+            extra_attention_mask = None
+            key_padding_mask = None
+
+        hidden_states = hidden_states.transpose(0, 1)
+        seq_len, bsz, embed_dim = hidden_states.size()
+        assert embed_dim == self.embed_dim
+        q = self.query(hidden_states)
+        k = self.key(hidden_states)
+        v = self.value(hidden_states)
+        q /= math.sqrt(self.head_dim)
+
+        q = q.view(seq_len, bsz, self.num_heads, self.head_dim).transpose(0, 1)
+        k = k.view(seq_len, bsz, self.num_heads, self.head_dim).transpose(0, 1)
+        # joblib.dump([q, k, v, remove_from_windowed_attention_mask, bsz, seq_len, extra_attention_mask, max_num_extra_indices_per_batch, selection_padding_mask_zeros, key_padding_mask, hidden_states, output_attentions, extra_attention_mask_nonzeros, selection_padding_mask_nonzeros, embed_dim], "msa_inputs.pkl")
+        # assert False
+        context_layer, attn_weights = self.predict(q, k, v, remove_from_windowed_attention_mask, bsz, seq_len, extra_attention_mask, max_num_extra_indices_per_batch, selection_padding_mask_zeros, key_padding_mask, hidden_states, output_attentions, extra_attention_mask_nonzeros, selection_padding_mask_nonzeros, embed_dim)
+
         outputs = (context_layer, attn_weights) if output_attentions else (context_layer,)
         return outputs
